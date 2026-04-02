@@ -63,20 +63,7 @@ func FormatActionLatency(started time.Time, auditEntryID string) string {
 		processSeconds = 0
 	}
 
-	totalSeconds := processSeconds
-	if auditEntryID != "" {
-		if entryTime, err := discordgo.SnowflakeTimestamp(auditEntryID); err == nil {
-			candidate := time.Since(entryTime).Seconds()
-			// Ignore impossible/old values and prefer the slower of processing vs audit age.
-			if candidate >= 0 && candidate <= 30 {
-				if candidate > totalSeconds {
-					totalSeconds = candidate
-				}
-			}
-		}
-	}
-
-	return fmt.Sprintf("%.2fs", totalSeconds)
+	return fmt.Sprintf("%.2fs", processSeconds)
 }
 
 func traceAntiNuke(guildID, event, step string, started time.Time) {
@@ -426,6 +413,13 @@ func SendAntiNukeLogToChannel(s *discordgo.Session, guildID, logChannel string, 
 	_, _ = s.ChannelMessageSendEmbed(logChannel, embed)
 }
 
+func moderationPermission(moderationType string) int {
+	if strings.EqualFold(moderationType, "kick") {
+		return discordgo.PermissionKickMembers
+	}
+	return discordgo.PermissionBanMembers
+}
+
 func MakeRequest(method, url, token string, body []byte) (resBody []byte, err error) {
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(body))
 	if err != nil {
@@ -499,17 +493,36 @@ func handleAuditAction(s *discordgo.Session, guildID, reason string, auditType i
 		return
 	}
 
-	selfMember, err := getMember(s, guildID, s.State.User.ID)
-	if err != nil {
+	type memberResult struct {
+		member *discordgo.Member
+		err    error
+	}
+	selfResultCh := make(chan memberResult, 1)
+	targetResultCh := make(chan memberResult, 1)
+
+	go func() {
+		member, memberErr := getMember(s, guildID, s.State.User.ID)
+		selfResultCh <- memberResult{member: member, err: memberErr}
+	}()
+	go func() {
+		member, memberErr := getMember(s, guildID, entry.UserID)
+		targetResultCh <- memberResult{member: member, err: memberErr}
+	}()
+
+	selfResult := <-selfResultCh
+	if selfResult.err != nil {
 		traceAntiNuke(guildID, reason, "self-member-miss", started)
 		return
 	}
 
-	targetMember, err := getMember(s, guildID, entry.UserID)
-	if err != nil {
+	targetResult := <-targetResultCh
+	if targetResult.err != nil {
 		traceAntiNuke(guildID, reason, "target-member-miss", started)
 		return
 	}
+
+	selfMember := selfResult.member
+	targetMember := targetResult.member
 
 	targetHighest := HighestRole(s, guildID, targetMember)
 	selfHighest := HighestRole(s, guildID, selfMember)
@@ -518,7 +531,7 @@ func handleAuditAction(s *discordgo.Session, guildID, reason string, auditType i
 		return
 	}
 
-	if !IsAbove(selfHighest, targetHighest) || !HasPerms(s, nil, guildID, s.State.User.ID, discordgo.PermissionBanMembers) {
+	if !IsAbove(selfHighest, targetHighest) || !HasPerms(s, nil, guildID, s.State.User.ID, moderationPermission(moderationType)) {
 		traceAntiNuke(guildID, reason, "hierarchy-skip", started)
 		return
 	}
@@ -529,28 +542,31 @@ func handleAuditAction(s *discordgo.Session, guildID, reason string, auditType i
 	}
 	traceAntiNuke(guildID, reason, "moderation-complete", started)
 
-	recoveryStatus := "not requested"
-	if recovery != nil {
-		if recoveryErr := recovery(entry); recoveryErr != nil {
-			recoveryStatus = "failed"
-		} else {
-			recoveryStatus = "success"
+	actionDuration := FormatActionLatency(started, entry.ID)
+	go func() {
+		recoveryStatus := "not requested"
+		if recovery != nil {
+			if recoveryErr := recovery(entry); recoveryErr != nil {
+				recoveryStatus = "failed"
+			} else {
+				recoveryStatus = "success"
+			}
 		}
-	}
 
-	crimeText := reason
-	if recovery != nil {
-		crimeText = fmt.Sprintf("%s | recovery: %s", reason, recoveryStatus)
-	}
-	SendAntiNukeLogToChannel(s, guildID, logChannel, AntiNukeLogData{
-		EventTitle:     reason,
-		CriminalID:     entry.UserID,
-		Crime:          crimeText,
-		VictimID:       entry.TargetID,
-		CounterAction:  moderationType,
-		ActionDuration: FormatActionLatency(started, entry.ID),
-	})
-	traceAntiNuke(guildID, reason, "log-sent", started)
+		crimeText := reason
+		if recovery != nil {
+			crimeText = fmt.Sprintf("%s | recovery: %s", reason, recoveryStatus)
+		}
+		SendAntiNukeLogToChannel(s, guildID, logChannel, AntiNukeLogData{
+			EventTitle:     reason,
+			CriminalID:     entry.UserID,
+			Crime:          crimeText,
+			VictimID:       entry.TargetID,
+			CounterAction:  moderationType,
+			ActionDuration: actionDuration,
+		})
+		traceAntiNuke(guildID, reason, "log-sent", started)
+	}()
 }
 
 func ReadAudit(s *discordgo.Session, guildID, reason string, auditType int) {
