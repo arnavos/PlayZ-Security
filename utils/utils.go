@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,18 +29,29 @@ type AntiNukeLogData struct {
 
 type RecoveryFunc func(*discordgo.AuditLogEntry) error
 
+type AuditActionOptions struct {
+	GuildData database.GuildData
+}
+
 type offenseRecord struct {
 	Count int
 	Last  time.Time
 }
 
 var (
-	auditCacheMu   sync.Mutex
-	auditSeen      = make(map[string]time.Time)
-	offenseCache   = make(map[string]offenseRecord)
-	offenseWindow  = 12 * time.Second
-	auditTTLWindow = 2 * time.Minute
+	auditCacheMu          sync.Mutex
+	auditSeen             = make(map[string]time.Time)
+	offenseCache          = make(map[string]offenseRecord)
+	offenseWindow         = 12 * time.Second
+	auditTTLWindow        = 2 * time.Minute
+	nextAuditCacheSweep   time.Time
+	nextOffenseCacheSweep time.Time
 )
+
+var antiNukeTraceEnabled = func() bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv("PLAYZ_TRACE_ANTINUKE")))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}()
 
 func FormatReason(reason string) string {
 	return fmt.Sprintf("%s | %s", ReasonPrefix, reason)
@@ -67,7 +79,38 @@ func FormatActionLatency(started time.Time, auditEntryID string) string {
 	return fmt.Sprintf("%.2fs", totalSeconds)
 }
 
+func traceAntiNuke(guildID, event, step string, started time.Time) {
+	if !antiNukeTraceEnabled {
+		return
+	}
+
+	fmt.Printf("[AntiNuke Trace] guild=%s event=%s step=%s elapsed=%s\n", guildID, event, step, time.Since(started).Round(time.Millisecond))
+}
+
+func getMember(s *discordgo.Session, guildID, userID string) (*discordgo.Member, error) {
+	member, err := s.State.Member(guildID, userID)
+	if err == nil {
+		return member, nil
+	}
+
+	return s.GuildMember(guildID, userID)
+}
+
+func getThreshold(data database.GuildData) int {
+	threshold := 1
+	if thresholdStr, ok := data["offense-threshold"].(string); ok {
+		if parsed, err := strconv.Atoi(thresholdStr); err == nil && parsed > 0 {
+			threshold = parsed
+		}
+	}
+	return threshold
+}
+
 func FindAudit(s *discordgo.Session, guildID string, auditType int) (*discordgo.AuditLogEntry, interface{}, error) {
+	return findAuditWithOptions(s, guildID, auditType, "")
+}
+
+func findAuditWithOptions(s *discordgo.Session, guildID string, auditType int, ownerID string) (*discordgo.AuditLogEntry, interface{}, error) {
 	if !HasPerms(s, nil, guildID, s.State.User.ID, discordgo.PermissionViewAuditLogs) {
 		return nil, nil, fmt.Errorf("missing audit log permissions in guild %s", guildID)
 	}
@@ -98,16 +141,17 @@ func FindAudit(s *discordgo.Session, guildID string, auditType int) (*discordgo.
 	if auditLog == nil {
 		return nil, nil, fmt.Errorf("no usable audit entry")
 	}
-	if GetGuildOwner(s, guildID) == auditLog.UserID {
+
+	if ownerID == "" {
+		ownerID = GetGuildOwner(s, guildID)
+	}
+	if ownerID == auditLog.UserID {
 		return auditLog, nil, fmt.Errorf("Whitelisted")
 	}
 
-	targetMember, err := s.State.Member(guildID, auditLog.UserID)
+	targetMember, err := getMember(s, guildID, auditLog.UserID)
 	if err != nil {
-		targetMember, err = s.GuildMember(guildID, auditLog.UserID)
-		if err != nil {
-			return nil, nil, err
-		}
+		return nil, nil, err
 	}
 
 	if database.Database.IsWhitelisted(guildID, "users", auditLog.UserID, targetMember) {
@@ -126,10 +170,13 @@ func markAuditSeen(entryID string) bool {
 	defer auditCacheMu.Unlock()
 
 	now := time.Now()
-	for id, ts := range auditSeen {
-		if now.Sub(ts) > auditTTLWindow {
-			delete(auditSeen, id)
+	if nextAuditCacheSweep.IsZero() || now.After(nextAuditCacheSweep) {
+		for id, ts := range auditSeen {
+			if now.Sub(ts) > auditTTLWindow {
+				delete(auditSeen, id)
+			}
 		}
+		nextAuditCacheSweep = now.Add(auditTTLWindow / 2)
 	}
 
 	if _, ok := auditSeen[entryID]; ok {
@@ -144,10 +191,13 @@ func addOffense(guildID, userID string, threshold int) bool {
 	defer auditCacheMu.Unlock()
 
 	now := time.Now()
-	for key, record := range offenseCache {
-		if now.Sub(record.Last) > offenseWindow {
-			delete(offenseCache, key)
+	if nextOffenseCacheSweep.IsZero() || now.After(nextOffenseCacheSweep) {
+		for key, record := range offenseCache {
+			if now.Sub(record.Last) > offenseWindow {
+				delete(offenseCache, key)
+			}
 		}
+		nextOffenseCacheSweep = now.Add(offenseWindow / 2)
 	}
 
 	key := guildID + ":" + userID
@@ -274,16 +324,19 @@ func HighestRole(s *discordgo.Session, guildID string, member *discordgo.Member)
 		return nil
 	}
 
+	roleByID := make(map[string]*discordgo.Role, len(guild.Roles))
+	for _, role := range guild.Roles {
+		roleByID[role.ID] = role
+	}
+
 	var highest *discordgo.Role
 	for _, roleID := range member.Roles {
-		for _, role := range guild.Roles {
-			if roleID != role.ID {
-				continue
-			}
-			if highest == nil || IsAbove(role, highest) {
-				highest = role
-			}
-			break
+		role := roleByID[roleID]
+		if role == nil {
+			continue
+		}
+		if highest == nil || IsAbove(role, highest) {
+			highest = role
 		}
 	}
 	if highest == nil {
@@ -398,26 +451,39 @@ func MakeRequest(method, url, token string, body []byte) (resBody []byte, err er
 	return resBody, nil
 }
 
-func handleAuditAction(s *discordgo.Session, guildID, reason string, auditType int, recovery RecoveryFunc) {
+func handleAuditAction(s *discordgo.Session, guildID, reason string, auditType int, recovery RecoveryFunc, options AuditActionOptions) {
 	started := time.Now()
+	traceAntiNuke(guildID, reason, "start", started)
 
-	entry, _, err := FindAudit(s, guildID, auditType)
+	guildData := options.GuildData
+	var err error
+	if guildData == nil {
+		guildData, err = database.Database.FindData(guildID)
+		if err != nil {
+			traceAntiNuke(guildID, reason, "guild-data-miss", started)
+			return
+		}
+	}
+
+	ownerID := GetGuildOwner(s, guildID)
+	entry, _, err := findAuditWithOptions(s, guildID, auditType, ownerID)
 	if err != nil || entry == nil {
+		traceAntiNuke(guildID, reason, "audit-miss", started)
 		return
 	}
+	traceAntiNuke(guildID, reason, "audit-found", started)
+
 	if entry.UserID == s.State.User.ID {
+		traceAntiNuke(guildID, reason, "self-entry-skip", started)
 		return
 	}
-	if GetGuildOwner(s, guildID) == entry.UserID {
+	if ownerID == entry.UserID {
+		traceAntiNuke(guildID, reason, "owner-skip", started)
 		return
 	}
 
 	if !markAuditSeen(entry.ID) {
-		return
-	}
-
-	guildData, err := database.Database.FindData(guildID)
-	if err != nil {
+		traceAntiNuke(guildID, reason, "duplicate-entry-skip", started)
 		return
 	}
 
@@ -426,47 +492,42 @@ func handleAuditAction(s *discordgo.Session, guildID, reason string, auditType i
 		moderationType = "ban"
 	}
 	logChannel, _ := guildData["log-channel"].(string)
-
-	thresholdInt := 1
-	if thresholdStr, ok := guildData["offense-threshold"].(string); ok {
-		if parsed, parseErr := strconv.Atoi(thresholdStr); parseErr == nil && parsed > 0 {
-			thresholdInt = parsed
-		}
-	}
+	thresholdInt := getThreshold(guildData)
 
 	if !addOffense(guildID, entry.UserID, thresholdInt) {
+		traceAntiNuke(guildID, reason, "threshold-not-met", started)
 		return
 	}
 
-	selfMember, err := s.State.Member(guildID, s.State.User.ID)
+	selfMember, err := getMember(s, guildID, s.State.User.ID)
 	if err != nil {
-		selfMember, err = s.GuildMember(guildID, s.State.User.ID)
-		if err != nil {
-			return
-		}
+		traceAntiNuke(guildID, reason, "self-member-miss", started)
+		return
 	}
 
-	targetMember, err := s.State.Member(guildID, entry.UserID)
+	targetMember, err := getMember(s, guildID, entry.UserID)
 	if err != nil {
-		targetMember, err = s.GuildMember(guildID, entry.UserID)
-		if err != nil {
-			return
-		}
+		traceAntiNuke(guildID, reason, "target-member-miss", started)
+		return
 	}
 
 	targetHighest := HighestRole(s, guildID, targetMember)
 	selfHighest := HighestRole(s, guildID, selfMember)
 	if targetHighest == nil || selfHighest == nil {
+		traceAntiNuke(guildID, reason, "role-check-miss", started)
 		return
 	}
 
 	if !IsAbove(selfHighest, targetHighest) || !HasPerms(s, nil, guildID, s.State.User.ID, discordgo.PermissionBanMembers) {
+		traceAntiNuke(guildID, reason, "hierarchy-skip", started)
 		return
 	}
 
 	if err := HandleModerationWithType(s, guildID, entry.UserID, reason, moderationType); err != nil {
+		traceAntiNuke(guildID, reason, "moderation-failed", started)
 		return
 	}
+	traceAntiNuke(guildID, reason, "moderation-complete", started)
 
 	recoveryStatus := "not requested"
 	if recovery != nil {
@@ -489,14 +550,23 @@ func handleAuditAction(s *discordgo.Session, guildID, reason string, auditType i
 		CounterAction:  moderationType,
 		ActionDuration: FormatActionLatency(started, entry.ID),
 	})
+	traceAntiNuke(guildID, reason, "log-sent", started)
 }
 
 func ReadAudit(s *discordgo.Session, guildID, reason string, auditType int) {
-	handleAuditAction(s, guildID, reason, auditType, nil)
+	handleAuditAction(s, guildID, reason, auditType, nil, AuditActionOptions{})
 }
 
 func ReadAuditWithRecovery(s *discordgo.Session, guildID, reason string, auditType int, recovery RecoveryFunc) {
-	handleAuditAction(s, guildID, reason, auditType, recovery)
+	handleAuditAction(s, guildID, reason, auditType, recovery, AuditActionOptions{})
+}
+
+func ReadAuditWithData(s *discordgo.Session, guildID, reason string, auditType int, guildData database.GuildData) {
+	handleAuditAction(s, guildID, reason, auditType, nil, AuditActionOptions{GuildData: guildData})
+}
+
+func ReadAuditWithRecoveryData(s *discordgo.Session, guildID, reason string, auditType int, guildData database.GuildData, recovery RecoveryFunc) {
+	handleAuditAction(s, guildID, reason, auditType, recovery, AuditActionOptions{GuildData: guildData})
 }
 
 func RemoveFromSlice(slice []string, item string) []string {

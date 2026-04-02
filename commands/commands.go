@@ -41,13 +41,11 @@ func (cmds *Commands) Match(s *discordgo.Session, raw *discordgo.Message, contex
 		return nil, nil
 	}
 
-	collection, err := database.Database.FindData(raw.GuildID)
+	prefix, err := database.Database.GetPrefix(raw.GuildID)
 	if err != nil {
 		_, _ = s.ChannelMessageSend(raw.ChannelID, fmt.Sprintf("```Failed to get the database collection: %s```", err.Error()))
 		return nil, nil
 	}
-
-	prefix, _ := collection["prefix"].(string)
 	if prefix == "" {
 		prefix = ">"
 	}

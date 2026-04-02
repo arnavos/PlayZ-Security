@@ -3,7 +3,6 @@ package commands
 import (
 	"bufio"
 	"fmt"
-	"math/rand"
 	"os"
 	"runtime"
 	"strconv"
@@ -11,14 +10,13 @@ import (
 	"time"
 
 	"github.com/summrs-dev-team/summrs-premium/events"
-	"github.com/summrs-dev-team/summrs-premium/utils"
 
 	"github.com/bwmarrin/discordgo"
 )
 
 func (cmd *Commands) BotInfo(s *discordgo.Session, m *discordgo.Message, ctx *Context) {
 	uptime := time.Since(botStartedAt).Round(time.Second)
-	heartbeat := s.HeartbeatLatency().Round(1 * time.Millisecond)
+	heartbeat := formatLatency(s.HeartbeatLatency())
 	ramLine := "RAM: `N/A`"
 	if usedMB, totalMB, ok := getSystemRAMUsageMB(); ok && totalMB > 0 {
 		ramLine = fmt.Sprintf("RAM: `%d/%d MB`", usedMB, totalMB)
@@ -47,7 +45,7 @@ func (cmd *Commands) BotInfo(s *discordgo.Session, m *discordgo.Message, ctx *Co
 				Value: strings.Join([]string{
 					ramLine,
 					cpuLine,
-					fmt.Sprintf("Ping: `%s`", heartbeat),
+					fmt.Sprintf("Gateway: `%s`", heartbeat),
 					fmt.Sprintf("Go: `%s`", runtime.Version()),
 				}, "\n"),
 				Inline: true,
@@ -69,31 +67,6 @@ func (cmd *Commands) BotInfo(s *discordgo.Session, m *discordgo.Message, ctx *Co
 	})
 }
 
-func (cmd *Commands) Credits(s *discordgo.Session, m *discordgo.Message, ctx *Context) {
-	s.ChannelMessageSendEmbed(m.ChannelID, &discordgo.MessageEmbed{
-		Title: "🙌 Credits",
-		Fields: []*discordgo.MessageEmbedField{
-			{Name: "Creators:", Value: "[!fishgang Cy](https://github.com/Not-Cyrus) - Rewrote it in golang\n[lxi](https://github.com/lxi1400) - Made original bot/ bot hoster\n[four](https://tenor.com/view/bearded-bear-guy-slay-gay-pride-super-gay-lgbt-gif-16465293) - bot owner (lxi bb)\n[jinx](https://google.com)  - bot owner"},
-		},
-		Footer: &discordgo.MessageEmbedFooter{Text: fmt.Sprintf("Requested by: %s", m.Author.Username)},
-		Color:  ThemeColor,
-	})
-}
-
-func (cmds *Commands) Fox(s *discordgo.Session, m *discordgo.Message, ctx *Context) {
-	rand.Seed(time.Now().Unix())
-
-	resBody, err := utils.MakeRequest("GET", "https://raw.githubusercontent.com/Not-Cyrus/fox-pic-repo/main/count.txt", "", nil)
-	if err != nil {
-		s.ChannelMessageSend(m.ChannelID, "Error: could not fetch the amount of fox pics, try re-running the command.")
-		return
-	}
-
-	maxcount, _ := strconv.Atoi(strings.TrimSuffix(string(resBody), "\n"))
-
-	s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("https://raw.githubusercontent.com/Not-Cyrus/fox-pic-repo/main/%d.jpg", rand.Intn(maxcount-0)+0))
-}
-
 func (cmd *Commands) Invite(s *discordgo.Session, m *discordgo.Message, ctx *Context) {
 
 	s.ChannelMessageSendEmbed(m.ChannelID, &discordgo.MessageEmbed{
@@ -106,17 +79,42 @@ func (cmd *Commands) Invite(s *discordgo.Session, m *discordgo.Message, ctx *Con
 }
 
 func (cmd *Commands) Ping(s *discordgo.Session, m *discordgo.Message, ctx *Context) {
-	latencyMs := s.HeartbeatLatency().Milliseconds()
+	started := time.Now()
 
-	s.ChannelMessageSendEmbed(m.ChannelID, &discordgo.MessageEmbed{
-		Title:       "Pong <a:dots:1489200629036617750>",
-		Description: fmt.Sprintf("`%d` ms", latencyMs),
-		Thumbnail:   &discordgo.MessageEmbedThumbnail{URL: "https://cdn.discordapp.com/emojis/885681753593872455.gif?size=2048"},
+	sent, err := s.ChannelMessageSendEmbed(m.ChannelID, &discordgo.MessageEmbed{
+		Title:       "Pinging...",
+		Description: "Measuring gateway and message response time.",
 		Color:       ThemeColor,
 	})
+	if err != nil || sent == nil {
+		return
+	}
+
+	apiLatency := time.Since(started)
+	editStarted := time.Now()
+
+	edit := discordgo.NewMessageEdit(sent.ChannelID, sent.ID)
+	edit.Embed = &discordgo.MessageEmbed{
+		Title: "Pong <a:dots:1489200629036617750>",
+		Description: strings.Join([]string{
+			fmt.Sprintf("API: `%s`", formatLatency(apiLatency)),
+			fmt.Sprintf("Gateway: `%s`", formatLatency(s.HeartbeatLatency())),
+			fmt.Sprintf("Edit: `%s`", formatLatency(time.Since(editStarted))),
+		}, "\n"),
+		Thumbnail: &discordgo.MessageEmbedThumbnail{URL: "https://cdn.discordapp.com/emojis/885681753593872455.gif?size=2048"},
+		Color:     ThemeColor,
+	}
+	_, _ = s.ChannelMessageEditComplex(edit)
 }
 
 var botStartedAt = time.Now()
+
+func formatLatency(latency time.Duration) string {
+	if latency <= 0 {
+		return "N/A"
+	}
+	return latency.Round(time.Millisecond).String()
+}
 
 func getSystemRAMUsageMB() (usedMB int, totalMB int, ok bool) {
 	file, err := os.Open("/proc/meminfo")

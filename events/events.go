@@ -104,7 +104,8 @@ func AntiMassMention(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	utils.SendAntiNukeLog(s, m.GuildID, utils.AntiNukeLogData{
+	logChannel, _ := data["log-channel"].(string)
+	utils.SendAntiNukeLogToChannel(s, m.GuildID, logChannel, utils.AntiNukeLogData{
 		EventTitle:     eventTitle,
 		CriminalID:     m.Author.ID,
 		Crime:          strings.ToLower(reason),
@@ -127,7 +128,7 @@ func BanHandler(s *discordgo.Session, event *discordgo.GuildBanAdd) {
 		return
 	}
 
-	utils.ReadAuditWithRecovery(s, event.GuildID, "banned a member", 22, func(entry *discordgo.AuditLogEntry) error {
+	utils.ReadAuditWithRecoveryData(s, event.GuildID, "banned a member", 22, data, func(entry *discordgo.AuditLogEntry) error {
 		if entry.TargetID == "" {
 			return fmt.Errorf("missing banned user id")
 		}
@@ -147,7 +148,7 @@ func BanRemoveHandler(s *discordgo.Session, event *discordgo.GuildBanRemove) {
 		return
 	}
 
-	utils.ReadAuditWithRecovery(s, event.GuildID, "unbanned a member", 23, func(entry *discordgo.AuditLogEntry) error {
+	utils.ReadAuditWithRecoveryData(s, event.GuildID, "unbanned a member", 23, data, func(entry *discordgo.AuditLogEntry) error {
 		if entry.TargetID == "" {
 			return fmt.Errorf("missing unbanned user id")
 		}
@@ -168,7 +169,7 @@ func ChannelCreate(s *discordgo.Session, event *discordgo.ChannelCreate) {
 		return
 	}
 
-	utils.ReadAuditWithRecovery(s, event.GuildID, "created a channel", 10, func(entry *discordgo.AuditLogEntry) error {
+	utils.ReadAuditWithRecoveryData(s, event.GuildID, "created a channel", 10, data, func(entry *discordgo.AuditLogEntry) error {
 		if entry.TargetID == "" {
 			return fmt.Errorf("missing created channel id")
 		}
@@ -190,7 +191,7 @@ func ChannelRemove(s *discordgo.Session, event *discordgo.ChannelDelete) {
 		return
 	}
 
-	utils.ReadAuditWithRecovery(s, event.GuildID, "deleted a channel", 12, func(entry *discordgo.AuditLogEntry) error {
+	utils.ReadAuditWithRecoveryData(s, event.GuildID, "deleted a channel", 12, data, func(entry *discordgo.AuditLogEntry) error {
 		if event.Channel == nil {
 			return fmt.Errorf("missing deleted channel payload")
 		}
@@ -220,7 +221,7 @@ func ChannelUpdate(s *discordgo.Session, event *discordgo.ChannelUpdate) {
 		return
 	}
 
-	utils.ReadAuditWithRecovery(s, event.GuildID, "updated a channel", 11, func(entry *discordgo.AuditLogEntry) error {
+	utils.ReadAuditWithRecoveryData(s, event.GuildID, "updated a channel", 11, data, func(entry *discordgo.AuditLogEntry) error {
 		if event.BeforeUpdate == nil || event.Channel == nil {
 			return fmt.Errorf("missing channel before state for recovery")
 		}
@@ -284,7 +285,7 @@ func GuildUpdate(s *discordgo.Session, event *discordgo.GuildUpdate) {
 	}
 
 	if toggleWithDefault(guildData, "anti-guild-update", true) {
-		utils.ReadAudit(s, event.Guild.ID, "updated guild settings", 1)
+		utils.ReadAuditWithData(s, event.Guild.ID, "updated guild settings", 1, guildData)
 	}
 
 	entry, _, auditErr := utils.FindAudit(s, event.Guild.ID, 1)
@@ -343,10 +344,10 @@ func KickHandler(s *discordgo.Session, event *discordgo.GuildMemberRemove) {
 	}
 
 	if enabled, _ := data["anti-kick"].(bool); enabled {
-		utils.ReadAudit(s, event.GuildID, "kicked a member", 20)
+		utils.ReadAuditWithData(s, event.GuildID, "kicked a member", 20, data)
 	}
 	if enabled, _ := data["anti-prune"].(bool); enabled {
-		utils.ReadAudit(s, event.GuildID, "ran member prune", 21)
+		utils.ReadAuditWithData(s, event.GuildID, "ran member prune", 21, data)
 	}
 }
 
@@ -382,7 +383,8 @@ func MemberJoin(s *discordgo.Session, event *discordgo.GuildMemberAdd) {
 
 	_ = utils.HandleModerationWithType(s, event.GuildID, entry.UserID, "Anti Bot Invite", moderationType)
 	_ = utils.HandleModerationWithType(s, event.GuildID, event.User.ID, "Anti Bot Invite", moderationType)
-	utils.SendAntiNukeLog(s, event.GuildID, utils.AntiNukeLogData{
+	logChannel, _ := data["log-channel"].(string)
+	utils.SendAntiNukeLogToChannel(s, event.GuildID, logChannel, utils.AntiNukeLogData{
 		EventTitle:     "Bot Invite",
 		CriminalID:     entry.UserID,
 		Crime:          fmt.Sprintf("invited bot (%s)", event.User.Username),
@@ -443,7 +445,8 @@ func MemberRoleUpdate(s *discordgo.Session, event *discordgo.GuildMemberUpdate) 
 		return
 	}
 
-	utils.SendAntiNukeLog(s, event.GuildID, utils.AntiNukeLogData{
+	logChannel, _ := data["log-channel"].(string)
+	utils.SendAntiNukeLogToChannel(s, event.GuildID, logChannel, utils.AntiNukeLogData{
 		EventTitle:     "Admin Role Update",
 		CriminalID:     entry.UserID,
 		Crime:          "gave administrator role to a member",
@@ -469,7 +472,7 @@ func RoleCreate(s *discordgo.Session, event *discordgo.GuildRoleCreate) {
 	if enabled, _ := data["anti-role-create"].(bool); !enabled {
 		return
 	}
-	utils.ReadAuditWithRecovery(s, event.GuildID, "created a role", 30, func(entry *discordgo.AuditLogEntry) error {
+	utils.ReadAuditWithRecoveryData(s, event.GuildID, "created a role", 30, data, func(entry *discordgo.AuditLogEntry) error {
 		if entry.TargetID == "" {
 			return fmt.Errorf("missing created role id")
 		}
@@ -488,7 +491,7 @@ func RoleRemove(s *discordgo.Session, event *discordgo.GuildRoleDelete) {
 	if enabled, _ := data["anti-role-delete"].(bool); !enabled {
 		return
 	}
-	utils.ReadAuditWithRecovery(s, event.GuildID, "deleted a role", 32, func(entry *discordgo.AuditLogEntry) error {
+	utils.ReadAuditWithRecoveryData(s, event.GuildID, "deleted a role", 32, data, func(entry *discordgo.AuditLogEntry) error {
 		recoveredName := "Auto-Recovered Role"
 		for _, change := range entry.Changes {
 			if change.Key == nil {
@@ -522,7 +525,7 @@ func RoleUpdate(s *discordgo.Session, event *discordgo.GuildRoleUpdate) {
 		return
 	}
 
-	utils.ReadAuditWithRecovery(s, event.GuildID, "updated a role", 31, func(entry *discordgo.AuditLogEntry) error {
+	utils.ReadAuditWithRecoveryData(s, event.GuildID, "updated a role", 31, data, func(entry *discordgo.AuditLogEntry) error {
 		if entry.TargetID == "" {
 			return fmt.Errorf("missing updated role id")
 		}
@@ -636,7 +639,8 @@ func WebhookCreate(s *discordgo.Session, event *discordgo.WebhooksUpdate) {
 			continue
 		}
 
-		utils.SendAntiNukeLog(s, event.GuildID, utils.AntiNukeLogData{
+		logChannel, _ := data["log-channel"].(string)
+		utils.SendAntiNukeLogToChannel(s, event.GuildID, logChannel, utils.AntiNukeLogData{
 			EventTitle:     "Webhook Create",
 			CriminalID:     webhook.User.ID,
 			Crime:          "created a webhook",

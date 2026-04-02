@@ -32,7 +32,14 @@ func (b *Bot) Shard(token string, shardCount, shardID int) {
 	s.ShardCount = shardCount
 	s.ShardID = shardID
 
-	s.Identify.Intents = discordgo.MakeIntent(discordgo.IntentsAllWithoutPrivileged | discordgo.IntentsGuildMembers)
+	s.Identify.Intents = discordgo.MakeIntent(
+		discordgo.IntentsGuilds |
+			discordgo.IntentsGuildMembers |
+			discordgo.IntentsGuildBans |
+			discordgo.IntentsGuildMessages |
+			discordgo.IntentsGuildWebhooks |
+			discordgo.IntentsMessageContent,
+	)
 
 	// ** Handlers ** //
 

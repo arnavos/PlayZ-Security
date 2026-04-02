@@ -25,8 +25,9 @@ type SQLiteDB struct {
 }
 
 type cacheEntry struct {
-	Data      GuildData
-	ExpiresAt time.Time
+	Data       GuildData
+	Whitelists map[string]map[string]struct{}
+	ExpiresAt  time.Time
 }
 
 func cloneGuildData(in GuildData) GuildData {
@@ -44,6 +45,42 @@ func cloneGuildData(in GuildData) GuildData {
 	return out
 }
 
+func cloneWhitelistLookup(in map[string]map[string]struct{}) map[string]map[string]struct{} {
+	if in == nil {
+		return nil
+	}
+
+	out := make(map[string]map[string]struct{}, len(in))
+	for key, values := range in {
+		copied := make(map[string]struct{}, len(values))
+		for value := range values {
+			copied[value] = struct{}{}
+		}
+		out[key] = copied
+	}
+	return out
+}
+
+func buildWhitelistLookup(data GuildData) map[string]map[string]struct{} {
+	keys := []string{"users", "whitelisted-roles", "whitelisted-invite-channels", "whitelisted-webhook-channels"}
+	lookup := make(map[string]map[string]struct{}, len(keys))
+
+	for _, key := range keys {
+		values, ok := data[key].([]string)
+		if !ok || len(values) == 0 {
+			continue
+		}
+
+		entries := make(map[string]struct{}, len(values))
+		for _, value := range values {
+			entries[value] = struct{}{}
+		}
+		lookup[key] = entries
+	}
+
+	return lookup
+}
+
 func (db *SQLiteDB) setCache(guildID string, data GuildData) {
 	db.Mu.Lock()
 	defer db.Mu.Unlock()
@@ -51,8 +88,9 @@ func (db *SQLiteDB) setCache(guildID string, data GuildData) {
 		db.Cache = make(map[string]cacheEntry)
 	}
 	db.Cache[guildID] = cacheEntry{
-		Data:      cloneGuildData(data),
-		ExpiresAt: time.Now().Add(db.CacheTTL),
+		Data:       cloneGuildData(data),
+		Whitelists: buildWhitelistLookup(data),
+		ExpiresAt:  time.Now().Add(db.CacheTTL),
 	}
 }
 
@@ -67,6 +105,21 @@ func (db *SQLiteDB) getCache(guildID string) (GuildData, bool) {
 		return nil, false
 	}
 	return cloneGuildData(entry.Data), true
+}
+
+func (db *SQLiteDB) getCachedWhitelistLookup(guildID string) (map[string]map[string]struct{}, bool) {
+	db.Mu.RLock()
+	defer db.Mu.RUnlock()
+
+	entry, ok := db.Cache[guildID]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(entry.ExpiresAt) {
+		return nil, false
+	}
+
+	return cloneWhitelistLookup(entry.Whitelists), true
 }
 
 func (db *SQLiteDB) invalidateCache(guildID string) {
@@ -134,33 +187,33 @@ func (db *SQLiteDB) CreateGuild(_ *discordgo.User, guild *discordgo.Guild) {
 	}
 
 	defaults := map[string]interface{}{
-		"antinuke-enabled":    false,
-		"anti-invite":         "off",
+		"antinuke-enabled":      false,
+		"anti-invite":           "off",
 		"anti-everyone-mention": true,
 		"anti-here-mention":     true,
-		"anti-ban":            true,
-		"anti-bot":            true,
-		"anti-kick":           true,
-		"anti-prune":          true,
-		"anti-guild-update":   true,
-		"anti-name-change":    true,
-		"anti-widget-spam":    true,
-		"anti-member-role":    true,
-		"anti-role-create":    true,
-		"anti-role-delete":    true,
-		"anti-role-update":    true,
-		"anti-vanity-steal":   true,
-		"anti-channel-create": true,
-		"anti-channel-delete": true,
-		"anti-channel-update": true,
-		"anti-webhook-create": true,
-		"guild-id":            guild.ID,
-		"guild-name":          guild.Name,
-		"log-channel":         "nil",
-		"moderation-type":     "ban",
-		"prefix":              ">",
-		"offense-threshold":   "1",
-		"vanity-url":          guild.VanityURLCode,
+		"anti-ban":              true,
+		"anti-bot":              true,
+		"anti-kick":             true,
+		"anti-prune":            true,
+		"anti-guild-update":     true,
+		"anti-name-change":      true,
+		"anti-widget-spam":      true,
+		"anti-member-role":      true,
+		"anti-role-create":      true,
+		"anti-role-delete":      true,
+		"anti-role-update":      true,
+		"anti-vanity-steal":     true,
+		"anti-channel-create":   true,
+		"anti-channel-delete":   true,
+		"anti-channel-update":   true,
+		"anti-webhook-create":   true,
+		"guild-id":              guild.ID,
+		"guild-name":            guild.Name,
+		"log-channel":           "nil",
+		"moderation-type":       "ban",
+		"prefix":                ">",
+		"offense-threshold":     "1",
+		"vanity-url":            guild.VanityURLCode,
 	}
 
 	if err := db.ensureGuildDefaults(guild.ID, defaults); err != nil {
@@ -227,20 +280,73 @@ func (db *SQLiteDB) FindData(guildID string) (GuildData, error) {
 		return nil, errors.New("guild data not found")
 	}
 
-	data["users"] = db.getWhitelist(guildID, "users")
-	data["whitelisted-roles"] = db.getWhitelist(guildID, "whitelisted-roles")
-	data["whitelisted-invite-channels"] = db.getWhitelist(guildID, "whitelisted-invite-channels")
-	data["whitelisted-webhook-channels"] = db.getWhitelist(guildID, "whitelisted-webhook-channels")
+	whitelists := db.getAllWhitelists(guildID)
+	data["users"] = whitelists["users"]
+	data["whitelisted-roles"] = whitelists["whitelisted-roles"]
+	data["whitelisted-invite-channels"] = whitelists["whitelisted-invite-channels"]
+	data["whitelisted-webhook-channels"] = whitelists["whitelisted-webhook-channels"]
 
 	db.setCache(guildID, data)
 	return data, nil
 }
 
+func (db *SQLiteDB) GetPrefix(guildID string) (string, error) {
+	db.Mu.RLock()
+	if entry, ok := db.Cache[guildID]; ok && time.Now().Before(entry.ExpiresAt) {
+		if prefix, ok := entry.Data["prefix"].(string); ok && prefix != "" {
+			db.Mu.RUnlock()
+			return prefix, nil
+		}
+	}
+	db.Mu.RUnlock()
+
+	var prefix string
+	err := db.Conn.QueryRow(`SELECT value FROM guild_settings WHERE guild_id = ? AND key = 'prefix'`, guildID).Scan(&prefix)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return ">", nil
+	case err != nil:
+		return "", err
+	case strings.TrimSpace(prefix) == "":
+		return ">", nil
+	default:
+		return prefix, nil
+	}
+}
+
 func (db *SQLiteDB) IsWhitelisted(guildID, typeKey, id string, optionalMember *discordgo.Member) bool {
-	ids := db.getWhitelist(guildID, typeKey)
-	for _, whitelistedID := range ids {
-		if whitelistedID == id {
-			return true
+	if lookup, ok := db.getCachedWhitelistLookup(guildID); ok {
+		if ids := lookup[typeKey]; ids != nil {
+			if _, exists := ids[id]; exists {
+				return true
+			}
+		}
+
+		if optionalMember == nil {
+			return false
+		}
+
+		if roles := lookup["whitelisted-roles"]; len(roles) > 0 {
+			for _, memberRoleID := range optionalMember.Roles {
+				if _, exists := roles[memberRoleID]; exists {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
+	data, err := db.FindData(guildID)
+	if err != nil {
+		return false
+	}
+
+	if ids, ok := data[typeKey].([]string); ok {
+		for _, whitelistedID := range ids {
+			if whitelistedID == id {
+				return true
+			}
 		}
 	}
 
@@ -248,16 +354,51 @@ func (db *SQLiteDB) IsWhitelisted(guildID, typeKey, id string, optionalMember *d
 		return false
 	}
 
-	roles := db.getWhitelist(guildID, "whitelisted-roles")
-	for _, roleID := range roles {
-		for _, memberRoleID := range optionalMember.Roles {
-			if roleID == memberRoleID {
-				return true
+	if roles, ok := data["whitelisted-roles"].([]string); ok {
+		for _, roleID := range roles {
+			for _, memberRoleID := range optionalMember.Roles {
+				if roleID == memberRoleID {
+					return true
+				}
 			}
 		}
 	}
 
 	return false
+}
+
+func (db *SQLiteDB) getAllWhitelists(guildID string) map[string][]string {
+	result := map[string][]string{
+		"users":                        {},
+		"whitelisted-roles":            {},
+		"whitelisted-invite-channels":  {},
+		"whitelisted-webhook-channels": {},
+	}
+
+	rows, err := db.Conn.Query(`SELECT list_key, entry_id FROM whitelists WHERE guild_id = ?`, guildID)
+	if err != nil {
+		return result
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var listKey, entryID string
+		if scanErr := rows.Scan(&listKey, &entryID); scanErr != nil {
+			continue
+		}
+
+		result[listKey] = append(result[listKey], entryID)
+	}
+
+	return result
+}
+
+func (db *SQLiteDB) getWhitelist(guildID, valueKey string) []string {
+	all := db.getAllWhitelists(guildID)
+	if ids, ok := all[valueKey]; ok {
+		return ids
+	}
+	return []string{}
 }
 
 func (db *SQLiteDB) SetData(_ string, guildID, index, value string) (bool, error) {
@@ -288,24 +429,6 @@ func (db *SQLiteDB) addWhitelist(guildID, valueKey, id string) error {
 func (db *SQLiteDB) removeWhitelist(guildID, valueKey, id string) error {
 	_, err := db.Conn.Exec(`DELETE FROM whitelists WHERE guild_id = ? AND list_key = ? AND entry_id = ?`, guildID, valueKey, id)
 	return err
-}
-
-func (db *SQLiteDB) getWhitelist(guildID, valueKey string) []string {
-	rows, err := db.Conn.Query(`SELECT entry_id FROM whitelists WHERE guild_id = ? AND list_key = ?`, guildID, valueKey)
-	if err != nil {
-		return []string{}
-	}
-	defer rows.Close()
-
-	ids := make([]string, 0)
-	for rows.Next() {
-		var id string
-		if scanErr := rows.Scan(&id); scanErr != nil {
-			continue
-		}
-		ids = append(ids, id)
-	}
-	return ids
 }
 
 func (db *SQLiteDB) SetWhitelistData(guildID, id, index, valueKey string) (bool, error) {
@@ -390,7 +513,7 @@ func SetupDB() SQLiteDB {
 		Conn:     conn,
 		Mu:       &sync.RWMutex{},
 		Cache:    make(map[string]cacheEntry),
-		CacheTTL: 3 * time.Second,
+		CacheTTL: time.Minute,
 	}
 }
 

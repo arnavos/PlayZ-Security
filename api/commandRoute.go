@@ -47,13 +47,6 @@ func init() {
 		Cooldown: 4,
 	})
 
-	commandRoute.Add("credits", commandRoute.Credits, &commands.Config{
-		Cooldown: 1,
-	})
-
-	commandRoute.Add("fox", commandRoute.Fox, &commands.Config{
-		Cooldown: 1,
-	})
 
 	commandRoute.Add("help", commandRoute.Help, &commands.Config{
 		Alias:    []string{"h"},
